@@ -1,0 +1,312 @@
+name: Fetch & Compress
+
+on:
+  workflow_dispatch:
+    inputs:
+      links:
+        description: "Links, space or comma separated. Leave EMPTY to use links.txt"
+        required: false
+        default: ""
+      max_height:
+        description: "Max video height (videos are never upscaled)"
+        type: choice
+        options: ["480", "720", "1080"]
+        default: "720"
+      video_codec:
+        description: "h265 = smaller files, h264 = plays on everything"
+        type: choice
+        options: ["h265", "h264"]
+        default: "h265"
+      storage:
+        description: "release = files up to ~1.9 GB each, repo never grows. data-branch = files <=90 MB, in git."
+        type: choice
+        options: ["release", "data-branch"]
+        default: "release"
+      chunk_gb:
+        description: "Big albums are split into jobs of about this many GB each (each job = its own runner)"
+        type: choice
+        options: ["4", "8", "12"]
+        default: "8"
+      append:
+        description: "Keep previous batches (old releases / data-branch history). Off = replace them."
+        type: boolean
+        default: false
+      scrape_all:
+        description: "Page of video links: try EVERY link found on the page (default = only links recognised as videos)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      count: ${{ steps.m.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Remove previous release batches
+        if: inputs.storage != 'data-branch' && inputs.append != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName -q '.[].tagName' \
+            | { grep '^run-' || true; } \
+            | xargs -r -n1 gh release delete --repo "$GITHUB_REPOSITORY" --cleanup-tag -y
+
+      - name: Plan jobs (list every link, split big albums)
+        id: m
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_LINKS: ${{ inputs.links }}
+          COOKIES: ${{ secrets.COOKIES }}
+          CHUNK_GB: ${{ inputs.chunk_gb }}
+          SCRAPE_ALL: ${{ inputs.scrape_all && '1' || '0' }}
+          CREATE_RELEASES: ${{ inputs.storage != 'data-branch' && '1' || '0' }}
+        run: |
+          pip install -q -U gallery-dl "yt-dlp[default,curl-cffi]" requests
+          python3 scripts/expand.py
+
+      - name: Save the plan (every job + verify read it)
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan
+          retention-days: 3
+          if-no-files-found: error
+
+  fetch:
+    needs: prepare
+    if: needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get the plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: plan
+
+      - name: Free disk space (big albums need room)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg aria2
+          pip install -q -U gallery-dl "yt-dlp[default,curl-cffi]" you-get \
+                            requests beautifulsoup4 pillow pillow-heif
+
+      - name: Download + compress
+        env:
+          URL: ${{ matrix.url }}
+          IDX: ${{ matrix.idx }}
+          RANGE: ${{ matrix.range }}
+          PART: ${{ matrix.part }}
+          TOOL: ${{ matrix.tool }}
+          EXPECTED: ${{ matrix.expected }}
+          PLAN_FILE: plan/plan.json
+          DEADLINE_MIN: "300"
+          MAX_HEIGHT: ${{ inputs.max_height }}
+          VIDEO_CODEC: ${{ inputs.video_codec }}
+          MAX_MB: ${{ inputs.storage == 'data-branch' && '90' || '1900' }}
+          COOKIES: ${{ secrets.COOKIES }}
+        run: python scripts/fetch.py "$URL" "$IDX" "$RANGE" "$PART"
+
+      - name: Upload to release (up to 2 GB per file)
+        if: always() && inputs.storage != 'data-branch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ matrix.tag }}
+          TITLE: ${{ matrix.title }}
+        run: |
+          set -uo pipefail
+          [ -d out ] || exit 0
+          mkdir -p upload
+          for d in out/*/; do
+            n="$(basename "$d")"
+            for f in "$d"*; do
+              [ -f "$f" ] || continue
+              # safe asset name; never overwrite another file that ended up with the same name
+              base="$(basename "$f" | sed 's/[^A-Za-z0-9._-]/_/g')"
+              dest="upload/${n}__${base}"
+              i=2
+              while [ -e "$dest" ]; do dest="upload/${n}__${i}_${base}"; i=$((i+1)); done
+              cp "$f" "$dest"
+            done
+          done
+          rm -f upload/*FAILED.txt upload/*_report.json
+          ls upload/* >/dev/null 2>&1 || exit 0
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" --notes "" --target "$GITHUB_SHA" || true
+
+          # every file we uploaded must really be listed on the release afterwards
+          upload_ok() {
+            rid="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id 2>/dev/null)" || return 1
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$rid/assets?per_page=100" \
+              --jq '.[].name' 2>/dev/null | sort > have.txt || return 1
+            (cd upload && ls -1 | sort) > want.txt
+            [ -z "$(comm -13 have.txt want.txt)" ]
+          }
+          gh release upload "$TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber || true
+          ok=0
+          for try in 1 2 3 4 5; do
+            if upload_ok; then ok=1; break; fi
+            [ "$try" = "5" ] && break
+            echo "upload incomplete (check $try), re-uploading only what is missing"; sleep 15
+            todo="$(comm -13 have.txt want.txt 2>/dev/null | sed 's|^|upload/|')"
+            [ -n "$todo" ] || todo="$(ls upload/*)"
+            gh release upload "$TAG" $todo --repo "$GITHUB_REPOSITORY" --clobber || true
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::some files are NOT on the release (missing: $(comm -13 have.txt want.txt | tr '\n' ' '))"
+            exit 1
+          fi
+          {
+            echo "### Files"
+            echo "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep this job's report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.job }}
+          path: reports
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.storage == 'data-branch'
+        with:
+          name: out-${{ matrix.job }}
+          path: out
+          retention-days: 3
+          if-no-files-found: ignore
+
+  verify:
+    needs: [prepare, fetch]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: plan
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: report-*
+          path: reports
+          merge-multiple: true
+
+      - name: Did every planned video arrive?
+        run: python3 scripts/verify.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: missing-links
+          path: verify_out
+          retention-days: 30
+          if-no-files-found: ignore
+
+  number:
+    needs: [prepare, fetch]
+    if: always() && inputs.storage != 'data-branch' && needs.prepare.result == 'success' && needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: number-releases
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Number files and releases (0, 1, 2, ...)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: python3 scripts/number_releases.py
+
+  publish:
+    needs: [prepare, fetch]
+    if: always() && inputs.storage == 'data-branch' && needs.prepare.result == 'success' && needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-data
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: staged
+          pattern: out-*
+          merge-multiple: true
+
+      - name: Commit to the data branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPEND: ${{ inputs.append }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(ls -A staged 2>/dev/null)" ]; then
+            echo "Nothing to publish."; exit 0
+          fi
+          STAMP="$(date -u +%Y-%m-%d_%H%M)-run${GITHUB_RUN_NUMBER}"
+
+          git init -q pub && cd pub
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if [ "$APPEND" = "true" ] && git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch -q --depth=1 origin data
+            git checkout -q -B data FETCH_HEAD
+          else
+            git checkout -q -b data
+          fi
+
+          mkdir -p "data/$STAMP"
+          cp -r ../staged/. "data/$STAMP/"
+          git add -A
+          git commit -q -m "Batch $STAMP"
+
+          if [ "$APPEND" = "true" ]; then
+            git push -q origin data
+          else
+            git push -q --force origin data
+          fi
+
+          {
+            echo "## Done"
+            echo "Files are on the **data** branch: https://github.com/${GITHUB_REPOSITORY}/tree/data/data/${STAMP}"
+            echo
+            echo '```'
+            (cd "data/$STAMP" && find . -type f ! -name '_report.json' -exec du -h {} + | sort -k2)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
